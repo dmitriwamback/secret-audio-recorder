@@ -61,6 +61,81 @@ function extractTarget(opStr) {
 	return match ? parseInt(match[0], 16) : null;
 }
 
+// Find the symbol (if any) that covers a given address. `symbols` must be
+// sorted ascending by address — parseSymbols() (elf.js) and
+// parseMachoSymbols() (macho.js) both already guarantee this.
+// Binary-searches for the last symbol whose address <= addr, then checks
+// addr actually falls within that symbol's size (so addresses in a gap
+// between two known functions correctly resolve to "no symbol").
+export function resolveSymbol(addr, symbols) {
+	if (!symbols || symbols.length === 0) return null;
+
+	let lo = 0,
+		hi = symbols.length - 1,
+		found = -1;
+	while (lo <= hi) {
+		const mid = (lo + hi) >> 1;
+		if (symbols[mid].address <= addr) {
+			found = mid;
+			lo = mid + 1;
+		} else {
+			hi = mid - 1;
+		}
+	}
+
+	if (found === -1) return null;
+	const sym = symbols[found];
+	if (sym.size > 0 && addr >= sym.address + sym.size) return null; // addr is past this symbol's end
+	return sym;
+}
+
+// Human-readable label for an address: the symbol name if one covers it
+// (with a "+0x.." suffix if addr is mid-function), otherwise a
+// Ghidra/IDA-style synthetic "sub_<hex>" label for unnamed code.
+export function labelForAddress(addr, symbols) {
+	const sym = resolveSymbol(addr, symbols);
+	if (!sym) return 'sub_' + addr.toString(16);
+	const delta = addr - sym.address;
+	return delta === 0 ? sym.name : `${sym.name}+0x${delta.toString(16)}`;
+}
+
+// Group a flat instruction stream into functions using symbol boundaries.
+// Any code not covered by a known symbol (stripped regions, gaps between
+// functions) becomes its own synthetic "sub_<hex>" function so every
+// instruction still ends up inside *some* function — useful for a
+// function-list sidebar in the UI.
+export function buildFunctions(instructions, symbols, textBase, textSize) {
+	const starts = symbols.map((s) => s.address);
+	if (starts.length === 0 || starts[0] !== textBase) starts.unshift(textBase);
+	starts.push(textBase + textSize); // synthetic end boundary
+	const bounds = [...new Set(starts)].sort((a, b) => a - b);
+
+	const functions = [];
+	for (let i = 0; i < bounds.length - 1; i++) {
+		const start = bounds[i];
+		const end = bounds[i + 1];
+		if (start >= end) continue;
+		const sym = symbols.find((s) => s.address === start);
+		functions.push({
+			name: sym ? sym.name : 'sub_' + start.toString(16),
+			start,
+			end,
+			instructions: []
+		});
+	}
+
+	// instructions come out of Capstone already sorted by address, so a
+	// single linear pass (rather than a binary search per instruction) is
+	// enough to bucket them into the right function.
+	let fi = 0;
+	for (const insn of instructions) {
+		while (fi < functions.length - 1 && insn.address >= functions[fi].end) fi++;
+		if (fi < functions.length) functions[fi].instructions.push(insn);
+	}
+
+	return functions;
+}
+
 // Disassemble the binary and return structured instruction data along with cross-references
 export async function disassembleBinary(parsed) {
 	await ensureLoaded();
@@ -75,6 +150,8 @@ export async function disassembleBinary(parsed) {
 	// though we passed baseAddr in. Re-apply it manually here so every
 	// address in the app (rows, xrefs, patch targets) is a real vaddr.
 	const base = parsed.text.baseAddr;
+
+	const symbols = parsed.symbols || [];
 
 	const instructions = raw.map((insn) => {
 		const group = classify(insn.mnemonic);
@@ -94,7 +171,10 @@ export async function disassembleBinary(parsed) {
 			operands: insn.opStr,
 			size: insn.size,
 			group,
-			target
+			target,
+			// e.g. "memcpy" or "sub_401120+0x8" for calls/jumps — use this
+			// in the UI instead of the raw hex target where you have it.
+			targetName: target !== null ? labelForAddress(target, symbols) : null
 		};
 	});
 
@@ -106,7 +186,11 @@ export async function disassembleBinary(parsed) {
 		}
 	}
 
-	return { instructions, xrefs };
+	// Grouped by symbol/function boundary — this is what a function-list
+	// sidebar should be built from, rather than the flat instruction array.
+	const functions = buildFunctions(instructions, symbols, base, parsed.text.size);
+
+	return { instructions, xrefs, functions };
 }
 
 export function reslice(parsed, fullFileBytes) {
